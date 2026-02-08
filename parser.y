@@ -1,376 +1,557 @@
-/* ================================================================== */
-/* PARSER.Y : Analyseur Syntaxique et Sémantique pour GLSimpleSQL     */
-/* ================================================================== */
-
 %{
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "structures.h" 
+#include "structures.h"
 
-/* --- Déclarations Externes --- */
-extern int yylex();          // Fonction générée par Flex
-extern int yylineno;         // Numéro de ligne courant (Flex)
-extern char *yytext;         // Texte du token courant
+#ifndef GLSIMPLESQL_AST_TYPES
+#define GLSIMPLESQL_AST_TYPES
 
-/* --- Gestion d'erreurs --- */
+typedef struct StrList {
+    char *s;
+    struct StrList *next;
+} StrList;
+
+typedef struct CondInfo {
+    int predicates;
+    int ands;
+    int ors;
+} CondInfo;
+
+typedef struct WhereInfo {
+    int has_where;
+    CondInfo c;
+} WhereInfo;
+
+typedef struct SelectInfo {
+    int has_star;
+    int mixed_star;
+    StrList *cols;
+    int col_count;
+} SelectInfo;
+
+typedef struct AssignInfo {
+    StrList *cols;
+    int count;
+} AssignInfo;
+
+#endif
+
+int yylex(void);
 void yyerror(const char *s);
+extern int yylineno;
 
-/* --- Fonctions Sémantiques (définies dans semantics.c) --- */
-extern Table *symbolTable;   // Tête de la liste des tables
-int check_table_exists(char *name);
-int check_field_exists(char *tableName, char *fieldName);
-void add_table(char *name, Field *fields);
-void drop_table_semantic(char *name);
-int get_field_count(char *tableName);
-
-/* --- Variables Globales pour le Context --- */
-char current_table_name[100]; // Pour se souvenir de la table en cours (SELECT/UPDATE)
-int  semantic_error_flag = 0; // Drapeau pour bloquer l'affichage si erreur
-%}
-
-/* ================================================================== */
-/* DÉFINITION DE L'UNION (Types de valeurs possibles)                 */
-/* ================================================================== */
-%union {
-    int ival;           // Pour les entiers et les compteurs (stats)
-    float fval;         // Pour les réels
-    char *sval;         // Pour les identifiants (noms) et chaînes
-    struct Field *fld;  // Pour construire la liste des champs (CREATE)
+static char* sdup(const char *s) {
+    if (!s) return NULL;
+    size_t n = strlen(s);
+    char *p = (char*)malloc(n + 1);
+    if (!p) exit(1);
+    memcpy(p, s, n + 1);
+    return p;
 }
 
-/* ================================================================== */
-/* DÉCLARATION DES TOKENS (Doit correspondre à scanner.l)             */
-/* ================================================================== */
+static void free_strlist(StrList *l) {
+    while (l) {
+        StrList *n = l->next;
+        free(l->s);
+        free(l);
+        l = n;
+    }
+}
 
-/* Mots-clés */
-%token T_SELECT T_FROM T_WHERE T_INSERT T_INTO T_VALUES 
-%token T_CREATE T_TABLE T_UPDATE T_SET T_DELETE T_DROP 
-%token T_AND T_OR T_NOT 
+static StrList* sl_cons(char *s, StrList *tail) {
+    StrList *n = (StrList*)malloc(sizeof(StrList));
+    if (!n) exit(1);
+    n->s = s;
+    n->next = tail;
+    return n;
+}
+
+static int sl_len(StrList *l) {
+    int c = 0;
+    while (l) { c++; l = l->next; }
+    return c;
+}
+
+static int sl_contains(StrList *l, const char *s) {
+    while (l) {
+        if (strcmp(l->s, s) == 0) return 1;
+        l = l->next;
+    }
+    return 0;
+}
+
+static Field* make_field(char *name, int type, int varchar_len) {
+    Field *f = (Field*)malloc(sizeof(Field));
+    if (!f) exit(1);
+    f->name = name;
+    f->type = type;
+    f->varchar_len = varchar_len;
+    f->next = NULL;
+    return f;
+}
+
+static Field* field_append(Field *list, Field *node) {
+    if (!list) return node;
+    Field *c = list;
+    while (c->next) c = c->next;
+    c->next = node;
+    return list;
+}
+
+static void semantic_error(const char *msg) {
+    fprintf(stderr, "ERREUR SEMANTIQUE ligne %d : %s\n", yylineno, msg);
+}
+
+static void print_select_stats(const char *table, SelectInfo si, WhereInfo wi) {
+    printf("TYPE=SELECT TABLE=%s ", table);
+    if (si.has_star && !si.mixed_star) printf("CHAMPS=* ");
+    else if (si.mixed_star) printf("CHAMPS=MIXTE ");
+    else printf("NB_CHAMPS=%d ", si.col_count);
+    printf("WHERE=%s ", wi.has_where ? "OUI" : "NON");
+    if (wi.has_where) {
+        printf("NB_CONDITIONS=%d NB_AND=%d NB_OR=%d", wi.c.predicates, wi.c.ands, wi.c.ors);
+    } else {
+        printf("NB_CONDITIONS=0 NB_AND=0 NB_OR=0");
+    }
+    printf("\n");
+}
+
+static void print_insert_stats(const char *table, int nbVals, int hasCols, int nbCols) {
+    printf("TYPE=INSERT TABLE=%s VALEURS=%d COLONNES=%s NB_COLONNES=%d\n",
+           table, nbVals, hasCols ? "OUI" : "NON", hasCols ? nbCols : 0);
+}
+
+static void print_update_stats(const char *table, int nbAssign, WhereInfo wi) {
+    printf("TYPE=UPDATE TABLE=%s NB_AFFECT=%d WHERE=%s ",
+           table, nbAssign, wi.has_where ? "OUI" : "NON");
+    if (wi.has_where) {
+        printf("NB_CONDITIONS=%d NB_AND=%d NB_OR=%d", wi.c.predicates, wi.c.ands, wi.c.ors);
+    } else {
+        printf("NB_CONDITIONS=0 NB_AND=0 NB_OR=0");
+    }
+    printf("\n");
+}
+
+static void print_delete_stats(const char *table, WhereInfo wi) {
+    printf("TYPE=DELETE TABLE=%s WHERE=%s ",
+           table, wi.has_where ? "OUI" : "NON");
+    if (wi.has_where) {
+        printf("NB_CONDITIONS=%d NB_AND=%d NB_OR=%d", wi.c.predicates, wi.c.ands, wi.c.ors);
+    } else {
+        printf("NB_CONDITIONS=0 NB_AND=0 NB_OR=0");
+    }
+    printf("\n");
+}
+
+static void print_create_stats(const char *table, int nbCols) {
+    printf("TYPE=CREATE TABLE=%s NB_COLONNES=%d\n", table, nbCols);
+}
+
+static void print_drop_stats(const char *table) {
+    printf("TYPE=DROP TABLE=%s\n", table);
+}
+
+static void check_columns_exist(const char *table, StrList *cols) {
+    StrList *c = cols;
+    while (c) {
+        if (!check_field_exists(table, c->s)) {
+            char buf[256];
+            snprintf(buf, sizeof(buf), "Champ inexistant '%s'", c->s);
+            semantic_error(buf);
+        }
+        c = c->next;
+    }
+}
+
+static void check_columns_unique(StrList *cols) {
+    for (StrList *a = cols; a; a = a->next) {
+        for (StrList *b = a->next; b; b = b->next) {
+            if (strcmp(a->s, b->s) == 0) {
+                semantic_error("Liste de colonnes contient des doublons");
+                return;
+            }
+        }
+    }
+}
+
+static void check_fields_unique(Field *fields) {
+    for (Field *a = fields; a; a = a->next) {
+        for (Field *b = a->next; b; b = b->next) {
+            if (strcmp(a->name, b->name) == 0) {
+                semantic_error("Colonnes en double dans CREATE TABLE");
+                return;
+            }
+        }
+    }
+}
+
+static void check_operand_id(const char *table, const char *maybeId, int isId) {
+    if (!isId) return;
+    if (!check_field_exists(table, maybeId)) {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "Champ inexistant '%s'", maybeId);
+        semantic_error(buf);
+    }
+}
+%}
+
+%code requires {
+#ifndef GLSIMPLESQL_AST_TYPES
+#define GLSIMPLESQL_AST_TYPES
+
+#include "structures.h"
+
+typedef struct StrList {
+    char *s;
+    struct StrList *next;
+} StrList;
+
+typedef struct CondInfo {
+    int predicates;
+    int ands;
+    int ors;
+} CondInfo;
+
+typedef struct WhereInfo {
+    int has_where;
+    CondInfo c;
+} WhereInfo;
+
+typedef struct SelectInfo {
+    int has_star;
+    int mixed_star;
+    StrList *cols;
+    int col_count;
+} SelectInfo;
+
+typedef struct AssignInfo {
+    StrList *cols;
+    int count;
+} AssignInfo;
+
+#endif
+}
+
+%union {
+    int ival;
+    double fval;
+    char *sval;
+    Field *fieldp;
+    StrList *slist;
+    CondInfo cinfo;
+    WhereInfo winfo;
+    SelectInfo sinfo;
+    AssignInfo ainfo;
+    int dtype;
+    int count;
+}
+
+%token T_SELECT T_FROM T_WHERE T_INSERT T_INTO T_VALUES T_CREATE T_TABLE T_UPDATE T_SET T_DELETE T_DROP
+%token T_AND T_OR T_NOT
 %token T_INT T_FLOAT T_VARCHAR T_BOOL
 %token T_TRUE T_FALSE
-
-/* Opérateurs */
-%token T_EQ T_NEQ T_LT T_GT T_LEQ T_GEQ 
-
-/* Ponctuation */
+%token T_EQ T_NEQ T_LT T_GT T_LEQ T_GEQ
 %token T_SEMICOLON T_COMMA T_LPAREN T_RPAREN T_STAR
-
-/* Valeurs typées */
+%token <sval> T_ID
 %token <ival> T_INT_LIT
 %token <fval> T_FLOAT_LIT
-%token <sval> T_STRING_LIT T_ID
+%token <sval> T_STRING_LIT
 
-/* ================================================================== */
-/* TYPAGE DES NON-TERMINAUX                                           */
-/* ================================================================== */
-%type <fld> field_def_list field_def
-%type <ival> type_data
-%type <ival> value_list field_list_select assignment_list field_list_names
-%type <ival> condition condition_or condition_and condition_not condition_simple
-%type <ival> where_clause_opt
+%type <dtype> type_spec
+%type <fieldp> col_def col_def_list
+%type <slist> id_list opt_id_list value_list
+%type <count> opt_varchar_len
+%type <count> value
+%type <cinfo> condition predicate
+%type <winfo> where_opt
+%type <sinfo> select_list
+%type <ainfo> assign_list assign
 
-/* ================================================================== */
-/* RÈGLES DE PRÉCÉDENCE (Pour résoudre les conflits AND/OR)           */
-/* ================================================================== */
-/* On suit la logique SQL : NOT > AND > OR */
-%left T_OR
-%left T_AND
-%right T_NOT
+%start program
 
 %%
 
-/* ================================================================== */
-/* GRAMMAIRE BNF                                                      */
-/* ================================================================== */
-
-program:
-    statement_list
+program
+    : stmts
     ;
 
-statement_list:
-    statement_list statement
-    | statement
+stmts
+    : stmts stmt
+    | stmt
     ;
 
-statement:
-    create_stmt T_SEMICOLON
-    | insert_stmt T_SEMICOLON
-    | select_stmt T_SEMICOLON
-    | update_stmt T_SEMICOLON
-    | delete_stmt T_SEMICOLON
-    | drop_stmt T_SEMICOLON
-    | error T_SEMICOLON { yyerrok; } /* Reprise sur erreur */
+stmt
+    : create_stmt
+    | insert_stmt
+    | select_stmt
+    | update_stmt
+    | delete_stmt
+    | drop_stmt
     ;
 
-/* ------------------------------------------------------------------ */
-/* 1. CREATE TABLE                                                    */
-/* ------------------------------------------------------------------ */
-create_stmt:
-    T_CREATE T_TABLE T_ID T_LPAREN field_def_list T_RPAREN
-    {
-        /* Vérification sémantique : Table déjà existante ? */
-        if(check_table_exists($3)) {
-             fprintf(stderr, "ERREUR SÉMANTIQUE ligne %d : La table '%s' existe déjà.\n", yylineno, $3);
+create_stmt
+    : T_CREATE T_TABLE T_ID T_LPAREN col_def_list T_RPAREN T_SEMICOLON
+      {
+        char *table = $3;
+        Field *fields = $5;
+        int nbCols = 0;
+        for (Field *f = fields; f; f = f->next) nbCols++;
+        if (check_table_exists(table)) {
+            semantic_error("Table deja existante");
+            free(table);
+            free_fields(fields);
         } else {
-             add_table($3, $5);
-             printf("Requête CREATE analysée : Table '%s' créée avec succès.\n", $3);
-        }
-        free($3); // Libération du nom
-    }
-    ;
-
-field_def_list:
-    field_def T_COMMA field_def_list
-    {
-        $1->next = $3; /* Chaînage */
-        $$ = $1;
-    }
-    | field_def
-    {
-        $$ = $1;
-    }
-    ;
-
-field_def:
-    T_ID type_data
-    {
-        struct Field *f = malloc(sizeof(struct Field));
-        f->name = strdup($1);
-        f->type = $2;
-        f->next = NULL;
-        $$ = f;
-        free($1);
-    }
-    ;
-
-type_data:
-    T_INT                     { $$ = 1; /* Code pour INT */ }
-    | T_FLOAT                 { $$ = 2; /* Code pour FLOAT */ }
-    | T_BOOL                  { $$ = 3; /* Code pour BOOL */ }
-    | T_VARCHAR T_LPAREN T_INT_LIT T_RPAREN { $$ = 4; /* Code pour VARCHAR */ }
-    ;
-
-/* ------------------------------------------------------------------ */
-/* 2. INSERT INTO                                                     */
-/* ------------------------------------------------------------------ */
-insert_stmt:
-    T_INSERT T_INTO T_ID T_VALUES T_LPAREN value_list T_RPAREN
-    {
-        if(!check_table_exists($3)) {
-            fprintf(stderr, "ERREUR SÉMANTIQUE ligne %d : La table '%s' n'existe pas.\n", yylineno, $3);
-        } else {
-            int expected = get_field_count($3);
-            if($6 != expected) {
-                fprintf(stderr, "ERREUR SÉMANTIQUE ligne %d : INSERT INTO %s : %d valeurs fournies mais %d champs attendus.\n", 
-                        yylineno, $3, $6, expected);
+            check_fields_unique(fields);
+            if (!add_table(table, fields)) {
+                semantic_error("Echec ajout table (doublons possibles)");
+                free_fields(fields);
             } else {
-                printf("Requête INSERT analysée :\n");
-                printf(" - Table : %s\n", $3);
-                printf(" - Nombre de valeurs : %d\n", $6);
-                printf(" - Vérification : OK\n");
+                print_create_stats(table, nbCols);
+            }
+            free(table);
+        }
+      }
+    ;
+
+col_def_list
+    : col_def_list T_COMMA col_def
+      { $$ = field_append($1, $3); }
+    | col_def
+      { $$ = $1; }
+    ;
+
+col_def
+    : T_ID type_spec opt_varchar_len
+      { $$ = make_field($1, $2, $3); }
+    ;
+
+type_spec
+    : T_INT     { $$ = TYPE_INT; }
+    | T_FLOAT   { $$ = TYPE_FLOAT; }
+    | T_BOOL    { $$ = TYPE_BOOL; }
+    | T_VARCHAR { $$ = TYPE_VARCHAR; }
+    ;
+
+opt_varchar_len
+    : T_LPAREN T_INT_LIT T_RPAREN { $$ = $2; }
+    |                             { $$ = 0; }
+    ;
+
+insert_stmt
+    : T_INSERT T_INTO T_ID opt_id_list T_VALUES T_LPAREN value_list T_RPAREN T_SEMICOLON
+      {
+        char *table = $3;
+        StrList *cols = $4;
+        int nbVals = sl_len($7);
+        int hasCols = cols != NULL;
+        int nbCols = hasCols ? sl_len(cols) : 0;
+
+        if (!check_table_exists(table)) {
+            semantic_error("Table inexistante");
+        } else {
+            if (hasCols) {
+                check_columns_unique(cols);
+                check_columns_exist(table, cols);
+                if (nbCols != nbVals) semantic_error("Incoherence INSERT : nb colonnes != nb valeurs");
+            } else {
+                int expected = get_field_count(table);
+                if (expected != nbVals) semantic_error("Incoherence INSERT : nb champs table != nb valeurs");
+            }
+            print_insert_stats(table, nbVals, hasCols, nbCols);
+        }
+
+        free(table);
+        free_strlist(cols);
+        free_strlist($7);
+      }
+    ;
+
+opt_id_list
+    : T_LPAREN id_list T_RPAREN { $$ = $2; }
+    |                           { $$ = NULL; }
+    ;
+
+value_list
+    : value_list T_COMMA value  { $$ = sl_cons(sdup("v"), $1); }
+    | value                     { $$ = sl_cons(sdup("v"), NULL); }
+    ;
+
+value
+    : T_INT_LIT      { $$ = 1; }
+    | T_FLOAT_LIT    { $$ = 1; }
+    | T_STRING_LIT   { free($1); $$ = 1; }
+    | T_TRUE         { $$ = 1; }
+    | T_FALSE        { $$ = 1; }
+    ;
+
+select_stmt
+    : T_SELECT select_list T_FROM T_ID where_opt T_SEMICOLON
+      {
+        SelectInfo si = $2;
+        char *table = $4;
+        WhereInfo wi = $5;
+
+        if (!check_table_exists(table)) {
+            semantic_error("Table inexistante");
+        } else {
+            if (si.mixed_star) {
+                semantic_error("Utilisation invalide de * avec des champs");
+            }
+            if (!si.has_star) {
+                check_columns_unique(si.cols);
+                check_columns_exist(table, si.cols);
+            }
+            if (wi.has_where) {
+                CondInfo ci = wi.c;
+                (void)ci;
             }
         }
-        free($3);
-    }
-    | T_INSERT T_INTO T_ID T_LPAREN field_list_select T_RPAREN T_VALUES T_LPAREN value_list T_RPAREN
-    {
-        /* Version avec liste de colonnes spécifiée */
-        if(!check_table_exists($3)) {
-            fprintf(stderr, "ERREUR SÉMANTIQUE ligne %d : La table '%s' n'existe pas.\n", yylineno, $3);
+
+        print_select_stats(table, si, wi);
+
+        free(table);
+        free_strlist(si.cols);
+      }
+    ;
+
+select_list
+    : T_STAR
+      { $$ = (SelectInfo){1, 0, NULL, 0}; }
+    | id_list
+      { $$ = (SelectInfo){0, 0, $1, sl_len($1)}; }
+    | T_STAR T_COMMA id_list
+      { $$ = (SelectInfo){1, 1, $3, sl_len($3)}; }
+    ;
+
+id_list
+    : id_list T_COMMA T_ID
+      { $$ = sl_cons($3, $1); }
+    | T_ID
+      { $$ = sl_cons($1, NULL); }
+    ;
+
+where_opt
+    : T_WHERE condition
+      { $$ = (WhereInfo){1, $2}; }
+    | 
+      { $$ = (WhereInfo){0, (CondInfo){0,0,0}}; }
+    ;
+
+condition
+    : condition T_AND predicate
+      { $$ = (CondInfo){$1.predicates + $3.predicates, $1.ands + 1 + $3.ands, $1.ors + $3.ors}; }
+    | condition T_OR predicate
+      { $$ = (CondInfo){$1.predicates + $3.predicates, $1.ands + $3.ands, $1.ors + 1 + $3.ors}; }
+    | predicate
+      { $$ = $1; }
+    ;
+
+predicate
+    : opt_not operand comp_op operand
+      { $$ = (CondInfo){1,0,0}; }
+    ;
+
+opt_not
+    : T_NOT
+    |
+    ;
+
+comp_op
+    : T_EQ
+    | T_NEQ
+    | T_LT
+    | T_GT
+    | T_LEQ
+    | T_GEQ
+    ;
+
+operand
+    : T_ID
+      { free($1); }
+    | T_INT_LIT
+    | T_FLOAT_LIT
+    | T_STRING_LIT
+      { free($1); }
+    | T_TRUE
+    | T_FALSE
+    ;
+
+update_stmt
+    : T_UPDATE T_ID T_SET assign_list where_opt T_SEMICOLON
+      {
+        char *table = $2;
+        AssignInfo ai = $4;
+        WhereInfo wi = $5;
+
+        if (!check_table_exists(table)) {
+            semantic_error("Table inexistante");
         } else {
-            /* Vérifier cohérence colonnes / valeurs */
-            if ($5 != $9) {
-                fprintf(stderr, "ERREUR SÉMANTIQUE ligne %d : Incohérence, %d champs spécifiés pour %d valeurs.\n", yylineno, $5, $9);
-            } else {
-                printf("Requête INSERT (partiel) analysée :\n");
-                printf(" - Table : %s\n", $3);
-                printf(" - Valeurs insérées : %d\n", $9);
-            }
+            check_columns_unique(ai.cols);
+            check_columns_exist(table, ai.cols);
         }
-        free($3);
-    }
+
+        print_update_stats(table, ai.count, wi);
+
+        free(table);
+        free_strlist(ai.cols);
+      }
     ;
 
-value_list:
-    value_list T_COMMA value_literal { $$ = $1 + 1; }
-    | value_literal { $$ = 1; }
+assign_list
+    : assign_list T_COMMA assign
+      {
+        AssignInfo a = $1;
+        a.cols = sl_cons($3.cols->s, a.cols);
+        free($3.cols);
+        a.count += 1;
+        $$ = a;
+      }
+    | assign
+      { $$ = $1; }
     ;
 
-value_literal:
-    T_INT_LIT | T_FLOAT_LIT | T_STRING_LIT | T_TRUE | T_FALSE
+assign
+    : T_ID T_EQ value
+      {
+        AssignInfo a;
+        a.cols = sl_cons($1, NULL);
+        a.count = 1;
+        $$ = a;
+      }
     ;
 
-/* ------------------------------------------------------------------ */
-/* 3. SELECT                                                          */
-/* ------------------------------------------------------------------ */
-select_stmt:
-    T_SELECT field_list_select T_FROM T_ID where_clause_opt
-    {
-        semantic_error_flag = 0;
-        /* Vérif Table */
-        if(!check_table_exists($4)) {
-            fprintf(stderr, "ERREUR SÉMANTIQUE ligne %d : La table '%s' n'existe pas.\n", yylineno, $4);
-            semantic_error_flag = 1;
+delete_stmt
+    : T_DELETE T_FROM T_ID where_opt T_SEMICOLON
+      {
+        char *table = $3;
+        WhereInfo wi = $4;
+
+        if (!check_table_exists(table)) {
+            semantic_error("Table inexistante");
         }
-        
-        /* Si pas d'erreur, affichage des stats */
-        if(!semantic_error_flag) {
-            printf("----------------------------------\n");
-            printf("Requête SELECT analysée :\n");
-            printf(" - Table : %s\n", $4);
-            if ($2 == -1) printf(" - Nombre de champs : TOUS (*)\n");
-            else          printf(" - Nombre de champs : %d\n", $2);
-            
-            if ($5 == -1) {
-                printf(" - Clause WHERE : NON\n");
-            } else {
-                printf(" - Clause WHERE : OUI\n");
-                printf(" - Opérateurs logiques : %d\n", $5);
-            }
-            printf("----------------------------------\n");
-        }
-        free($4);
-    }
+
+        print_delete_stats(table, wi);
+
+        free(table);
+      }
     ;
 
-field_list_select:
-    T_STAR { $$ = -1; /* Code pour * */ }
-    | field_list_names { $$ = $1; }
-    ;
-
-field_list_names:
-    field_list_names T_COMMA T_ID 
-    { 
-        /* Ici on pourrait vérifier si T_ID existe dans la table, 
-           mais la table est connue seulement APRES le FROM.
-           Simplification pour ce projet : on compte juste. */
-        $$ = $1 + 1; 
-        free($3);
-    }
-    | T_ID 
-    { 
-        $$ = 1; 
-        free($1);
-    }
-    ;
-
-/* ------------------------------------------------------------------ */
-/* 4. UPDATE                                                          */
-/* ------------------------------------------------------------------ */
-update_stmt:
-    T_UPDATE T_ID T_SET assignment_list where_clause_opt
-    {
-        /* Sauvegarde nom table pour vérifs dans WHERE (via var globale si besoin) */
-        if(!check_table_exists($2)) {
-            fprintf(stderr, "ERREUR SÉMANTIQUE ligne %d : La table '%s' n'existe pas.\n", yylineno, $2);
+drop_stmt
+    : T_DROP T_TABLE T_ID T_SEMICOLON
+      {
+        char *table = $3;
+        if (!drop_table_semantic(table)) {
+            semantic_error("Table inexistante");
         } else {
-            printf("Requête UPDATE analysée :\n");
-            printf(" - Table : %s\n", $2);
-            printf(" - Champs modifiés : %d\n", $4);
-            printf(" - Clause WHERE : %s\n", ($5 == -1 ? "NON" : "OUI"));
+            print_drop_stats(table);
         }
-        free($2);
-    }
-    ;
-
-assignment_list:
-    assignment_list T_COMMA assignment { $$ = $1 + 1; }
-    | assignment { $$ = 1; }
-    ;
-
-assignment:
-    T_ID T_EQ value_literal
-    {
-        /* Vérification simplifiée : on pourrait vérifier si T_ID existe */
-        /* Note: Pour faire ça proprement, il faudrait connaître le nom de la table ici */
-        free($1);
-    }
-    ;
-
-/* ------------------------------------------------------------------ */
-/* 5. DELETE                                                          */
-/* ------------------------------------------------------------------ */
-delete_stmt:
-    T_DELETE T_FROM T_ID where_clause_opt
-    {
-        if(!check_table_exists($3)) {
-            fprintf(stderr, "ERREUR SÉMANTIQUE ligne %d : La table '%s' n'existe pas.\n", yylineno, $3);
-        } else {
-            printf("Requête DELETE analysée :\n");
-            printf(" - Table : %s\n", $3);
-            printf(" - Clause WHERE : %s\n", ($4 == -1 ? "NON" : "OUI"));
-        }
-        free($3);
-    }
-    ;
-
-/* ------------------------------------------------------------------ */
-/* 6. DROP TABLE                                                      */
-/* ------------------------------------------------------------------ */
-drop_stmt:
-    T_DROP T_TABLE T_ID
-    {
-        if(!check_table_exists($3)) {
-            fprintf(stderr, "ERREUR SÉMANTIQUE ligne %d : Impossible de supprimer, la table '%s' n'existe pas.\n", yylineno, $3);
-        } else {
-            drop_table_semantic($3);
-            printf("Requête DROP TABLE analysée : Table '%s' supprimée.\n", $3);
-        }
-        free($3);
-    }
-    ;
-
-/* ------------------------------------------------------------------ */
-/* CLAUSE WHERE ET CONDITIONS                                         */
-/* ------------------------------------------------------------------ */
-
-where_clause_opt:
-    T_WHERE condition { $$ = $2; /* Retourne le nombre d'opérateurs logiques */ }
-    | /* vide */      { $$ = -1; /* Code pour 'Pas de WHERE' */ }
-    ;
-
-/* Gestion de la précédence implicite via la grammaire ou %left */
-condition:
-    condition_or { $$ = $1; }
-    ;
-
-condition_or:
-    condition_or T_OR condition_and { $$ = $1 + $3 + 1; } /* +1 pour le OR */
-    | condition_and { $$ = $1; }
-    ;
-
-condition_and:
-    condition_and T_AND condition_not { $$ = $1 + $3 + 1; } /* +1 pour le AND */
-    | condition_not { $$ = $1; }
-    ;
-
-condition_not:
-    T_NOT condition_simple { $$ = $2; } /* NOT ne compte pas comme op binaire stat */
-    | condition_simple { $$ = $1; }
-    ;
-
-condition_simple:
-    T_ID comparator value_literal 
-    { 
-        /* Vérification si le champ existe (Optional enhancement) 
-           Pour ce projet, on retourne 0 car c'est une feuille (pas d'AND/OR ici) */
-        free($1);
-        $$ = 0; 
-    }
-    | T_LPAREN condition T_RPAREN { $$ = $2; }
-    ;
-
-comparator:
-    T_EQ | T_NEQ | T_LT | T_GT | T_LEQ | T_GEQ 
+        free(table);
+      }
     ;
 
 %%
-
-/* ================================================================== */
-/* CODE C SUPPLÉMENTAIRE                                              */
-/* ================================================================== */
 
 void yyerror(const char *s) {
-    fprintf(stderr, "ERREUR SYNTAXIQUE ligne %d : %s près de '%s'\n", yylineno, s, yytext);
+    fprintf(stderr, "ERREUR SYNTAXIQUE ligne %d : %s\n", yylineno, s);
 }

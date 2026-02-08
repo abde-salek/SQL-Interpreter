@@ -1,50 +1,38 @@
-/* ================================================================== */
-/* MAIN.C : Point d'entrée de l'interpréteur GLSimpleSQL              */
-/* ================================================================== */
-
 #include <stdio.h>
 #include <stdlib.h>
+#include "structures.h"
 
-/* --- Déclarations externes fournies par Flex/Bison --- */
-extern int yyparse();       // La fonction principale de parsing
-extern FILE *yyin;          // Le pointeur de fichier lu par le scanner
-extern int yylineno;        // Compteur de ligne
+extern int yyparse(void);
+extern FILE *yyin;
 
-int main(int argc, char *argv[]) {
-    
-    // 1. Vérification des arguments
+int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <fichier_requetes.sql>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <fichier.sql>\n", argv[0]);
         return 1;
     }
 
-    // 2. Ouverture du fichier SQL
-    FILE *file = fopen(argv[1], "r");
-    if (!file) {
-        perror("Erreur lors de l'ouverture du fichier");
+    FILE *f = fopen(argv[1], "r");
+    if (!f) {
+        perror("Erreur ouverture fichier");
         return 1;
     }
 
-    // 3. Configuration de Flex pour lire ce fichier
-    yyin = file;
-
-    printf("==================================================\n");
-    printf("   INTERPRÉTEUR GLSimpleSQL - DÉBUT D'ANALYSE\n");
+    yyin = f;
+        printf("==================================================\n");
+    printf("   INTERPRETEUR GLSimpleSQL - DEBUT D'ANALYSE\n");
     printf("==================================================\n");
 
-    // 4. Lancement de l'analyse syntaxique
-    // yyparse() renvoie 0 si succès, 1 si erreur syntaxique
-    int result = yyparse();
+    int r = yyparse();
 
     printf("==================================================\n");
-    if (result == 0) {
-        printf("   ANALYSE TERMINÉE AVEC SUCCÈS.\n");
+    if (r == 0) {
+        printf("   ANALYSE TERMINEE AVEC SUCCES.\n");
     } else {
-        printf("   ANALYSE TERMINÉE AVEC ERREURS.\n");
+        printf("   ANALYSE TERMINEE AVEC ERREURS.\n");
     }
     printf("==================================================\n");
 
-    // 5. Nettoyage
-    fclose(file);
-    return result;
+    fclose(f);
+    free_all_tables();
+    return r;
 }

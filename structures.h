@@ -1,13 +1,6 @@
-/* ================================================================== */
-/* STRUCTURES.H : Structures de données et Prototypes                 */
-/* ================================================================== */
-
 #ifndef STRUCTURES_H
 #define STRUCTURES_H
 
-/* --- 1. DÉFINITIONS DES STRUCTURES --- */
-
-// Types de données SQL supportés
 typedef enum {
     TYPE_INT = 1,
     TYPE_FLOAT = 2,
@@ -15,35 +8,29 @@ typedef enum {
     TYPE_VARCHAR = 4
 } DataType;
 
-// Structure pour un Champ (Colonne)
 typedef struct Field {
-    char *name;             // Nom du champ
-    int type;               // Type de donnée
-    struct Field *next;     // Chaînage vers le prochain champ
+    char *name;
+    int type;           /* TYPE_INT, TYPE_FLOAT, TYPE_BOOL, TYPE_VARCHAR */
+    int varchar_len;    /* 0 si pas VARCHAR(n) */
+    struct Field *next;
 } Field;
 
-// Structure pour une Table
 typedef struct Table {
-    char *name;             // Nom de la table
-    Field *fields;          // Pointeur vers la liste des champs
-    struct Table *next;     // Chaînage vers la prochaine table
+    char *name;
+    Field *fields;
+    struct Table *next;
 } Table;
 
-/* --- 2. VARIABLE GLOBALE (Accessible partout) --- */
 extern Table *symbolTable;
 
-/* --- 3. PROTOTYPES DES FONCTIONS (Implémentées dans semantics.c) --- */
+int check_table_exists(const char *name);
+int check_field_exists(const char *tableName, const char *fieldName);
 
-// Vérifie si une table existe (1 = Oui, 0 = Non)
-int check_table_exists(char *name);
+int add_table(const char *name, Field *fields);
+int get_field_count(const char *tableName);
+int drop_table_semantic(const char *name);
 
-// Ajoute une table à la table des symboles
-void add_table(char *name, Field *fields);
-
-// Compte le nombre de colonnes d'une table
-int get_field_count(char *tableName);
-
-// Supprime une table et nettoie la mémoire
-void drop_table_semantic(char *name);
+void free_fields(Field *fields);
+void free_all_tables(void);
 
 #endif

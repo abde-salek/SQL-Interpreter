@@ -90,3 +90,6 @@ DROP TABLE Camion;
 
 -- TEST 6 : Syntaxe invalide
 SELECT marque, FROM Voiture;
+
+-- TEST 7 : Utilisation invalide de *
+SELECT *, marque FROM Voiture;

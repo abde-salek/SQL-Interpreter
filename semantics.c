@@ -1,110 +1,101 @@
-/* ================================================================== */
-/* SEMANTICS.C : Implémentation de la Table des Symboles              */
-/* ================================================================== */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "structures.h"
 
-// Variable globale : Tête de la liste chaînée des tables
 Table *symbolTable = NULL;
 
-/* ------------------------------------------------------------------ */
-/* Fonction : check_table_exists                                      */
-/* Rôle : Vérifie si une table existe déjà par son nom                */
-/* Retourne : 1 (Vrai) ou 0 (Faux)                                    */
-/* ------------------------------------------------------------------ */
-int check_table_exists(char *name) {
-    Table *current = symbolTable;
-    while (current != NULL) {
-        if (strcmp(current->name, name) == 0) {
-            return 1; // Trouvé
+static int fields_have_duplicates(Field *fields) {
+    for (Field *a = fields; a; a = a->next) {
+        for (Field *b = a->next; b; b = b->next) {
+            if (strcmp(a->name, b->name) == 0) return 1;
         }
-        current = current->next;
     }
-    return 0; // Pas trouvé
+    return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* Fonction : add_table                                               */
-/* Rôle : Ajoute une nouvelle table et ses champs en mémoire          */
-/* ------------------------------------------------------------------ */
-void add_table(char *name, Field *fields) {
-    // 1. Allouer la nouvelle table
-    Table *newTable = (Table*)malloc(sizeof(Table));
-    
-    // 2. Copier le nom (strdup alloue la mémoire nécessaire)
-    newTable->name = strdup(name);
-    
-    // 3. Associer la liste des champs
-    newTable->fields = fields;
-    
-    // 4. Insérer en tête de liste (plus rapide)
-    newTable->next = symbolTable;
-    symbolTable = newTable;
-}
-
-/* ------------------------------------------------------------------ */
-/* Fonction : get_field_count                                         */
-/* Rôle : Compte le nombre de colonnes d'une table (pour INSERT)      */
-/* ------------------------------------------------------------------ */
-int get_field_count(char *tableName) {
-    Table *current = symbolTable;
-    
-    // Trouver la table
-    while (current != NULL) {
-        if (strcmp(current->name, tableName) == 0) {
-            // Table trouvée, compter les champs
-            int count = 0;
-            Field *f = current->fields;
-            while (f != NULL) {
-                count++;
-                f = f->next;
-            }
-            return count;
-        }
-        current = current->next;
+void free_fields(Field *fields) {
+    while (fields) {
+        Field *n = fields->next;
+        free(fields->name);
+        free(fields);
+        fields = n;
     }
-    return -1; // Table non trouvée (sécurité)
 }
 
-/* ------------------------------------------------------------------ */
-/* Fonction : drop_table_semantic                                     */
-/* Rôle : Supprime une table et libère toute la mémoire associée      */
-/* ------------------------------------------------------------------ */
-void drop_table_semantic(char *name) {
-    Table *current = symbolTable;
+int check_table_exists(const char *name) {
+    for (Table *t = symbolTable; t; t = t->next) {
+        if (strcmp(t->name, name) == 0) return 1;
+    }
+    return 0;
+}
+
+static Table* find_table(const char *name) {
+    for (Table *t = symbolTable; t; t = t->next) {
+        if (strcmp(t->name, name) == 0) return t;
+    }
+    return NULL;
+}
+
+int check_field_exists(const char *tableName, const char *fieldName) {
+    Table *t = find_table(tableName);
+    if (!t) return 0;
+    for (Field *f = t->fields; f; f = f->next) {
+        if (strcmp(f->name, fieldName) == 0) return 1;
+    }
+    return 0;
+}
+
+int add_table(const char *name, Field *fields) {
+    if (check_table_exists(name)) return 0;
+    if (fields_have_duplicates(fields)) return 0;
+
+    Table *t = (Table*)malloc(sizeof(Table));
+    if (!t) return 0;
+
+    t->name = _strdup(name); /* Windows */
+    if (!t->name) { free(t); return 0; }
+
+    t->fields = fields;
+    t->next = symbolTable;
+    symbolTable = t;
+    return 1;
+}
+
+int get_field_count(const char *tableName) {
+    Table *t = find_table(tableName);
+    if (!t) return -1;
+    int c = 0;
+    for (Field *f = t->fields; f; f = f->next) c++;
+    return c;
+}
+
+int drop_table_semantic(const char *name) {
+    Table *cur = symbolTable;
     Table *prev = NULL;
 
-    while (current != NULL) {
-        if (strcmp(current->name, name) == 0) {
-            // --- Suppression trouvée ---
-            
-            // 1. Détacher le noeud de la liste des tables
-            if (prev == NULL) {
-                symbolTable = current->next; // C'était le premier élément
-            } else {
-                prev->next = current->next; // C'était au milieu ou à la fin
-            }
+    while (cur) {
+        if (strcmp(cur->name, name) == 0) {
+            if (prev) prev->next = cur->next;
+            else symbolTable = cur->next;
 
-            // 2. Libérer les champs (Field) de cette table
-            Field *f = current->fields;
-            while (f != NULL) {
-                Field *tempF = f;
-                f = f->next;
-                free(tempF->name); // Libérer le nom du champ
-                free(tempF);       // Libérer la structure champ
-            }
-
-            // 3. Libérer la table elle-même
-            free(current->name);
-            free(current);
-            return;
+            free_fields(cur->fields);
+            free(cur->name);
+            free(cur);
+            return 1;
         }
-        
-        // Avancer
-        prev = current;
-        current = current->next;
+        prev = cur;
+        cur = cur->next;
+    }
+    return 0;
+}
+
+void free_all_tables(void) {
+    while (symbolTable) {
+        Table *n = symbolTable->next;
+        free_fields(symbolTable->fields);
+        free(symbolTable->name);
+        free(symbolTable);
+        symbolTable = n;
     }
 }
